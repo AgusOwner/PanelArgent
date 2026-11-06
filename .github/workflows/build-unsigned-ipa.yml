@@ -1,0 +1,42 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project ThreeOneOSFive.xcodeproj \
+            -target 3105 \
+            -sdk iphoneos \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            CONFIGURATION_BUILD_DIR="$(pwd)/build" \
+            clean build
+
+      - name: Package IPA
+        run: |
+          APP=$(ls build/*.app | head -1)
+          NAME=$(basename "$APP" .app)
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r "${NAME}-unsigned.ipa" Payload
+          echo "IPA_NAME=${NAME}-unsigned.ipa" >> $GITHUB_ENV
+          echo "APP_NAME=${NAME}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-unsigned-ipa
+          path: ${{ env.IPA_NAME }}
