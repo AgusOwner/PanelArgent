@@ -19,6 +19,9 @@ struct ThreeOneOSFiveApp: App {
     init() {
         setupLogCapture()
         log("app: 3105 launching — iOS \(AppInfo.osVersion) (\(AppInfo.osBuild)) \(AppInfo.machineName)")
+        // Antes de que se construya PatchProjectStore, para que su carga
+        // inicial ya incluya los paquetes incluidos en el bundle.
+        BundledPatchSeeder.seedIfNeeded()
     }
 
     private var language: AppLanguage {
@@ -89,7 +92,11 @@ struct ThreeOneOSFiveApp: App {
                 )
             }
             .onAppear {
-                BundledPatchSeeder.seedIfNeeded()
+                // Red de seguridad: si el sembrado del init no llegó a copiar
+                // nada y acá sí se instala algo, refrescamos la librería.
+                if BundledPatchSeeder.seedIfNeeded() > 0 {
+                    patchStore.reload()
+                }
                 if isLicensed, !showOnboarding {
                     appState.detectSupport()
                     checkForUpdate()

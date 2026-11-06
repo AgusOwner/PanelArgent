@@ -191,6 +191,7 @@
 			isa = PBXGroup;
 			children = (
 				3105A401 /* ThreeOneOSFive */,
+				3105P200 /* BundledPatches */,
 				3105A402 /* Products */,
 			);
 			sourceTree = "<group>";
