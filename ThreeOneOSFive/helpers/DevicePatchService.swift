@@ -2,33 +2,20 @@ import Foundation
 
 enum DevicePatchService {
     static func apply(project: PatchProject) throws -> PatchTransactionReceipt {
-        let bundleIDs = orderedBundleIdentifiers(in: project)
-        return try withResolvedContainers(bundleIDs: bundleIDs) { roots in
+        try withResolvedContainers(bundleIDs: orderedBundleIdentifiers(in: project)) { roots in
             try PatchTransaction.apply(
                 project: project,
                 backupRoot: try PatchProjectLibrary.backupRootURL(),
-                containerResolver: { bundleID in
-                    guard let root = roots[bundleID] else {
-                        throw PatchPackageError.targetAppUnavailable(bundleID)
-                    }
-                    return root
-                }
+                containerResolver: resolver(roots)
             )
         }
     }
 
     static func inspectRestore(receipt: PatchTransactionReceipt) throws -> PatchRestoreInspection {
-        let bundleIDs = try PatchTransaction.requiredBundleIdentifiers(for: receipt)
-        return try withResolvedContainers(bundleIDs: bundleIDs) { roots in
-            try PatchTransaction.inspectRestore(
-                receipt: receipt,
-                containerResolver: { bundleID in
-                    guard let root = roots[bundleID] else {
-                        throw PatchPackageError.targetAppUnavailable(bundleID)
-                    }
-                    return root
-                }
-            )
+        try withResolvedContainers(
+            bundleIDs: PatchTransaction.requiredBundleIdentifiers(for: receipt)
+        ) { roots in
+            try PatchTransaction.inspectRestore(receipt: receipt, containerResolver: resolver(roots))
         }
     }
 
@@ -36,17 +23,13 @@ enum DevicePatchService {
         receipt: PatchTransactionReceipt,
         allowChangedTargets: Bool = false
     ) throws {
-        let bundleIDs = try PatchTransaction.requiredBundleIdentifiers(for: receipt)
-        try withResolvedContainers(bundleIDs: bundleIDs) { roots in
+        try withResolvedContainers(
+            bundleIDs: PatchTransaction.requiredBundleIdentifiers(for: receipt)
+        ) { roots in
             try PatchTransaction.restore(
                 receipt: receipt,
                 allowChangedTargets: allowChangedTargets,
-                containerResolver: { bundleID in
-                    guard let root = roots[bundleID] else {
-                        throw PatchPackageError.targetAppUnavailable(bundleID)
-                    }
-                    return root
-                }
+                containerResolver: resolver(roots)
             )
         }
     }
@@ -55,17 +38,13 @@ enum DevicePatchService {
         receipt: PatchTransactionReceipt,
         project: PatchProject
     ) throws {
-        let bundleIDs = try PatchTransaction.requiredBundleIdentifiers(for: receipt)
-        try withResolvedContainers(bundleIDs: bundleIDs) { roots in
+        try withResolvedContainers(
+            bundleIDs: PatchTransaction.requiredBundleIdentifiers(for: receipt)
+        ) { roots in
             try PatchTransaction.resetToAppliedState(
                 receipt: receipt,
                 fallbackProject: project,
-                containerResolver: { bundleID in
-                    guard let root = roots[bundleID] else {
-                        throw PatchPackageError.targetAppUnavailable(bundleID)
-                    }
-                    return root
-                }
+                containerResolver: resolver(roots)
             )
         }
     }
@@ -75,164 +54,88 @@ enum DevicePatchService {
         return PatchTransaction.latestReceipt(projectID: projectID, backupRoot: backupRoot)
     }
 
+    private static func resolver(_ roots: [String: URL]) -> (String) throws -> URL {
+        { bundleID in
+            guard let root = roots[bundleID] else {
+                throw PatchPackageError.targetAppUnavailable(bundleID)
+            }
+            return root
+        }
+    }
+
     private static func orderedBundleIdentifiers(in project: PatchProject) -> [String] {
         project.allBundleIdentifiers
+    }
+
+    private static func canonical(_ path: String) -> URL {
+        PatchPathValidator.canonicalFileURL(URL(fileURLWithPath: path, isDirectory: true))
     }
 
     private static func withResolvedContainers<T>(
         bundleIDs: [String],
         operation: ([String: URL]) throws -> T
     ) throws -> T {
+        AppBundleLocator.invalidate()
+        defer { AppBundleLocator.releaseAllGrants() }
+
         var roots: [String: URL] = [:]
 
         for bundleID in bundleIDs {
-            // 1) Camino normal: MCM/geod vía ContainerStore.
+            // 1) MCM/MHA-C2: resuelve el path, pero en iOS 27 sin token.
             if let path = ContainerStore.resolveAppContainerPath(bundleID: bundleID),
                ContainerStore.isApplicationContainerPath(path) {
-                roots[bundleID] = PatchPathValidator.canonicalFileURL(
-                    URL(fileURLWithPath: path, isDirectory: true)
-                )
+                AppBundleLocator.grant(path)
+                roots[bundleID] = canonical(path)
+                log("patch: MCM resolved \(bundleID)")
                 continue
             }
 
-            // 2) Fallback: MCM deja de devolver contenedores de bundle en iOS 27.
-            //    Se resuelve por filesystem, sin depender de la versión.
-            if let resolved = PatchContainerFallback.resolve(bundleID: bundleID) {
-                log("patch: fallback resolver used for \(bundleID)")
-                roots[bundleID] = PatchPathValidator.canonicalFileURL(
-                    URL(fileURLWithPath: resolved, isDirectory: true)
-                )
+            // 2) MobileInstallation + filesystem + bad_query class-13.
+            if let resolved = AppBundleLocator.resolve(bundleID: bundleID) {
+                let path = resolved.dataPath ?? resolved.bundlePath
+                roots[bundleID] = canonical(path)
+                log("patch: filesystem resolved \(bundleID) -> \(path)")
                 continue
             }
 
-            // ---- DIAGNÓSTICO: se imprime solo cuando la resolución falla ----
-            log("diag: hasSandboxAccess = \(KernelExploit.hasSandboxAccess())")
+            // Diagnóstico honesto: separa "no instalada" de "sin acceso".
+            let bundlePath = AppBundleLocator.bundlePath(forBundleID: bundleID)
+            let dataPath = AppBundleLocator.dataPath(forBundleID: bundleID)
             for root in [
                 "/private/var/containers/Bundle/Application",
-                "/var/mobile/Containers/Data/Application"
+                "/private/var/mobile/Containers/Data/Application"
             ] {
-                let count = (try? FileManager.default.contentsOfDirectory(atPath: root))?.count ?? -1
-                log("diag: \(root) -> \(count) entradas")
+                let granted = AppBundleLocator.grant(root)
+                let count = ContainerStore.enumerateDirectories(path: root).count
+                log("diag: \(root) grant=\(granted) entradas=\(count)")
             }
-            log("diag: bundlePath = \(PatchContainerFallback.bundlePath(forBundleID: bundleID) ?? "nil")")
-            log("diag: dataPath = \(PatchContainerFallback.dataPath(forBundleID: bundleID) ?? "nil")")
-            // -----------------------------------------------------------------
+            log("diag: bundlePath=\(bundlePath ?? "nil") dataPath=\(dataPath ?? "nil")")
+            log("diag: \(bundleID) sin resolver — bundle inexistente o sandbox sin grants")
 
             throw PatchPackageError.targetAppUnavailable(bundleID)
         }
+
         return try operation(roots)
     }
 }
 
-// MARK: - Respaldo de resolución de contenedores
+// MARK: - Compatibilidad
 
-/// Resolución por sistema de archivos, sin MCM/geod.
-/// MCM dejó de devolver contenedores de bundle en iOS 27, así que esto se usa
-/// cuando `ContainerStore` no devuelve nada. No depende de la versión de iOS.
 enum PatchContainerFallback {
-
-    private static let bundleRoots = [
-        "/private/var/containers/Bundle/Application",
-        "/var/containers/Bundle/Application"
-    ]
-
-    private static let dataRoots = [
-        "/private/var/mobile/Containers/Data/Application",
-        "/var/mobile/Containers/Data/Application"
-    ]
-
-    private static let groupRoots = [
-        "/private/var/mobile/Containers/Shared/AppGroup",
-        "/var/mobile/Containers/Shared/AppGroup"
-    ]
-
-    private static let metadataName = ".com.apple.mobile_container_manager.metadata.plist"
-    private static let metadataIdentifierKey = "MCMMetadataIdentifier"
-
-    private static let lock = NSLock()
-    private static var bundleCache: [String: String] = [:]
-    private static var dataCache: [String: String] = [:]
-
-    /// Devuelve el contenedor de datos (donde apuntan las rutas de los patches)
-    /// o, si no hay datos, el bundle. nil si la app no está instalada.
     static func resolve(bundleID: String) -> String? {
-        guard !bundleID.isEmpty,
-              let bundlePath = bundlePath(forBundleID: bundleID) else { return nil }
-        return dataPath(forBundleID: bundleID) ?? bundlePath
+        guard let resolved = AppBundleLocator.resolve(bundleID: bundleID) else { return nil }
+        return resolved.dataPath ?? resolved.bundlePath
     }
 
     static func bundlePath(forBundleID bundleID: String) -> String? {
-        lock.lock()
-        let cached = bundleCache[bundleID]
-        lock.unlock()
-        if let cached, FileManager.default.fileExists(atPath: cached) { return cached }
-
-        for root in bundleRoots {
-            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
-            for entry in entries {
-                let containerPath = root + "/" + entry
-                guard let apps = try? FileManager.default.contentsOfDirectory(atPath: containerPath) else { continue }
-                for app in apps where app.hasSuffix(".app") {
-                    let appPath = containerPath + "/" + app
-                    let identifier = Bundle(path: appPath)?.bundleIdentifier
-                        ?? infoPlistIdentifier(appPath + "/Info.plist")
-                    guard identifier == bundleID else { continue }
-                    lock.lock(); bundleCache[bundleID] = appPath; lock.unlock()
-                    return appPath
-                }
-            }
-        }
-        return nil
+        AppBundleLocator.bundlePath(forBundleID: bundleID)
     }
 
     static func dataPath(forBundleID bundleID: String) -> String? {
-        lock.lock()
-        let cached = dataCache[bundleID]
-        lock.unlock()
-        if let cached, FileManager.default.fileExists(atPath: cached) { return cached }
-
-        if let found = container(withIdentifier: bundleID, in: dataRoots) {
-            lock.lock(); dataCache[bundleID] = found; lock.unlock()
-            return found
-        }
-        // Los App Groups se resuelven con la misma metadata.
-        return container(withIdentifier: bundleID, in: groupRoots)
+        AppBundleLocator.dataPath(forBundleID: bundleID)
     }
 
     static func invalidate() {
-        lock.lock()
-        bundleCache.removeAll()
-        dataCache.removeAll()
-        lock.unlock()
-    }
-
-    private static func container(withIdentifier identifier: String, in roots: [String]) -> String? {
-        for root in roots {
-            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
-            for entry in entries {
-                let containerPath = root + "/" + entry
-                let metadataPath = containerPath + "/" + metadataName
-                guard let data = FileManager.default.contents(atPath: metadataPath),
-                      let plist = try? PropertyListSerialization.propertyList(
-                        from: data,
-                        options: [],
-                        format: nil
-                      ) as? [String: Any],
-                      let value = plist[metadataIdentifierKey] as? String,
-                      value == identifier else { continue }
-                return containerPath
-            }
-        }
-        return nil
-    }
-
-    private static func infoPlistIdentifier(_ path: String) -> String? {
-        guard let data = FileManager.default.contents(atPath: path),
-              let plist = try? PropertyListSerialization.propertyList(
-                from: data,
-                options: [],
-                format: nil
-              ) as? [String: Any] else { return nil }
-        return plist["CFBundleIdentifier"] as? String
+        AppBundleLocator.invalidate()
     }
 }

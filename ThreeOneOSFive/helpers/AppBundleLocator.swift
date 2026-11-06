@@ -1,10 +1,16 @@
 import Foundation
 
-/// Resolución de contenedores por sistema de archivos, sin MCM/geod.
+/// Resolución de contenedores sin depender de tokens de MCM.
 ///
-/// MCM dejó de devolver contenedores de bundle en iOS 27, así que esta ruta
-/// se usa como respaldo (y como fuente principal) en todas las versiones.
-/// Requiere que el escape de sandbox ya esté activo.
+/// iOS 27 beta 5+ (24A5408d y posteriores, incluida la release) dejó de emitir
+/// sandbox extensions por MCM class-2: `container_copy_sandbox_token` devuelve
+/// NULL aunque la consulta resuelva. El token ya no sirve como fuente de
+/// verdad. Esta ruta resuelve por MobileInstallation y por filesystem, y pide
+/// un traversal grant con bad_query (class-13) sobre el contenedor, que es la
+/// única vía que no depende de MCM.
+///
+/// Los grants quedan activos hasta `releaseAllGrants()`: una extensión liberada
+/// deja de cubrir la escritura del patch.
 enum AppBundleLocator {
 
     private static let bundleRoots = [
@@ -22,24 +28,58 @@ enum AppBundleLocator {
         "/var/mobile/Containers/Shared/AppGroup"
     ]
 
-    private static let metadataName = ".com.apple.mobile_container_manager.metadata.plist"
-    private static let metadataIdentifierKey = "MCMMetadataIdentifier"
-
     private static let lock = NSLock()
     private static var bundleCache: [String: String] = [:]
     private static var dataCache: [String: String] = [:]
+    private static var installationCache: [String: String]?
+    private static var activeGrants: Set<Int64> = []
 
     struct Resolved {
         let bundlePath: String
         let dataPath: String?
     }
 
-    /// Punto de entrada único. Devuelve nil solo si el bundle no existe
-    /// realmente en el disco.
+    // MARK: - Grants
+
+    /// Pide acceso al path. Devuelve false si bad_query no entrega nada.
+    @discardableResult
+    static func grant(_ path: String) -> Bool {
+        guard !path.isEmpty else { return false }
+        let handle = ContainerStore.grantContainerAccess(path)
+        guard handle >= 0 else { return false }
+        lock.lock(); activeGrants.insert(handle); lock.unlock()
+        return true
+    }
+
+    static func releaseAllGrants() {
+        lock.lock()
+        let handles = activeGrants
+        activeGrants.removeAll()
+        lock.unlock()
+        for handle in handles { bad_query_release(handle) }
+    }
+
+    // MARK: - Entradas
+
     static func resolve(bundleID: String) -> Resolved? {
-        guard !bundleID.isEmpty,
-              let bundlePath = bundlePath(forBundleID: bundleID) else { return nil }
-        return Resolved(bundlePath: bundlePath, dataPath: dataPath(forBundleID: bundleID))
+        guard !bundleID.isEmpty else { return nil }
+
+        // 1) MobileInstallation entrega el path del contenedor de datos sin
+        //    necesitar token de MCM.
+        if let installed = installationPath(for: bundleID),
+           ContainerStore.isApplicationContainerPath(installed) {
+            grant(installed)
+            return Resolved(
+                bundlePath: bundlePath(forBundleID: bundleID) ?? installed,
+                dataPath: installed
+            )
+        }
+
+        // 2) Escaneo por filesystem con grants por directorio.
+        guard let bundlePath = bundlePath(forBundleID: bundleID) else { return nil }
+        let dataPath = dataPath(forBundleID: bundleID)
+        if let dataPath { grant(dataPath) }
+        return Resolved(bundlePath: bundlePath, dataPath: dataPath)
     }
 
     static func isInstalled(bundleID: String) -> Bool {
@@ -53,15 +93,13 @@ enum AppBundleLocator {
         if let cached, FileManager.default.fileExists(atPath: cached) { return cached }
 
         for root in bundleRoots {
-            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
-            for entry in entries {
-                let containerPath = root + "/" + entry
-                guard let apps = try? FileManager.default.contentsOfDirectory(atPath: containerPath) else { continue }
-                for app in apps where app.hasSuffix(".app") {
-                    let appPath = containerPath + "/" + app
+            grant(root)
+            for containerPath in entries(in: root) {
+                for appPath in entries(in: containerPath) where appPath.hasSuffix(".app") {
                     let identifier = Bundle(path: appPath)?.bundleIdentifier
-                        ?? infoPlistIdentifier(appPath + "/Info.plist")
+                        ?? infoPlistIdentifier((appPath as NSString).appendingPathComponent("Info.plist"))
                     guard identifier == bundleID else { continue }
+                    grant(appPath)
                     lock.lock(); bundleCache[bundleID] = appPath; lock.unlock()
                     return appPath
                 }
@@ -76,36 +114,56 @@ enum AppBundleLocator {
         lock.unlock()
         if let cached, FileManager.default.fileExists(atPath: cached) { return cached }
 
-        if let found = container(withIdentifier: bundleID, in: dataRoots) {
+        // Datos y App Groups comparten la misma metadata.
+        if let found = container(withIdentifier: bundleID, in: dataRoots + groupRoots) {
             lock.lock(); dataCache[bundleID] = found; lock.unlock()
             return found
         }
-        // Los App Groups se resuelven con la misma metadata.
-        return container(withIdentifier: bundleID, in: groupRoots)
+        return nil
     }
 
     static func invalidate() {
+        releaseAllGrants()
         lock.lock()
         bundleCache.removeAll()
         dataCache.removeAll()
+        installationCache = nil
         lock.unlock()
+    }
+
+    // MARK: - Interno
+
+    private static func installationPath(for bundleID: String) -> String? {
+        lock.lock()
+        var cache = installationCache
+        lock.unlock()
+
+        if cache == nil {
+            var built: [String: String] = [:]
+            for app in ContainerStore.installedAppsFromAPI() {
+                let path = ContainerDiscoveryMerger.canonicalPath(app.containerPath)
+                if !path.isEmpty { built[app.bundleID] = path }
+            }
+            lock.lock(); installationCache = built; lock.unlock()
+            cache = built
+        }
+        return cache?[bundleID]
+    }
+
+    private static func entries(in path: String) -> [String] {
+        ContainerStore.enumerateDirectories(path: path).map { entry in
+            entry.hasPrefix("/") ? entry : (path as NSString).appendingPathComponent(entry)
+        }
     }
 
     private static func container(withIdentifier identifier: String, in roots: [String]) -> String? {
         for root in roots {
-            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
-            for entry in entries {
-                let containerPath = root + "/" + entry
-                let metadataPath = containerPath + "/" + metadataName
-                guard let data = FileManager.default.contents(atPath: metadataPath),
-                      let plist = try? PropertyListSerialization.propertyList(
-                        from: data,
-                        options: [],
-                        format: nil
-                      ) as? [String: Any],
-                      let value = plist[metadataIdentifierKey] as? String,
-                      value == identifier else { continue }
-                return containerPath
+            grant(root)
+            for dir in entries(in: root) {
+                guard UUID(uuidString: (dir as NSString).lastPathComponent) != nil else { continue }
+                grant(dir)
+                guard ContainerStore.readContainerMetadata(containerPath: dir)?.bundleID == identifier else { continue }
+                return ContainerDiscoveryMerger.canonicalPath(dir)
             }
         }
         return nil
