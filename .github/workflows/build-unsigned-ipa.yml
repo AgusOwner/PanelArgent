@@ -13,7 +13,7 @@ jobs:
         run: |
           xcodebuild \
             -project ThreeOneOSFive.xcodeproj \
-            -target 3105 \
+            -target Argent \
             -sdk iphoneos \
             -configuration Release \
             -destination 'generic/platform=iOS' \
