@@ -105,6 +105,19 @@ enum DevicePatchService {
                 continue
             }
 
+            // ---- DIAGNÓSTICO: se imprime solo cuando la resolución falla ----
+            log("diag: hasSandboxAccess = \(KernelExploit.hasSandboxAccess())")
+            for root in [
+                "/private/var/containers/Bundle/Application",
+                "/var/mobile/Containers/Data/Application"
+            ] {
+                let count = (try? FileManager.default.contentsOfDirectory(atPath: root))?.count ?? -1
+                log("diag: \(root) -> \(count) entradas")
+            }
+            log("diag: bundlePath = \(PatchContainerFallback.bundlePath(forBundleID: bundleID) ?? "nil")")
+            log("diag: dataPath = \(PatchContainerFallback.dataPath(forBundleID: bundleID) ?? "nil")")
+            // -----------------------------------------------------------------
+
             throw PatchPackageError.targetAppUnavailable(bundleID)
         }
         return try operation(roots)
