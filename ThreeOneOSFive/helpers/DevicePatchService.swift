@@ -86,11 +86,27 @@ enum DevicePatchService {
         var roots: [String: URL] = [:]
 
         for bundleID in bundleIDs {
-            guard let path = ContainerStore.resolveAppContainerPath(bundleID: bundleID),
-                  ContainerStore.isApplicationContainerPath(path) else {
-                throw PatchPackageError.targetAppUnavailable(bundleID)
+            // 1) Camino normal: MCM/geod vía ContainerStore.
+            if let path = ContainerStore.resolveAppContainerPath(bundleID: bundleID),
+               ContainerStore.isApplicationContainerPath(path) {
+                roots[bundleID] = PatchPathValidator.canonicalFileURL(
+                    URL(fileURLWithPath: path, isDirectory: true)
+                )
+                continue
             }
-            roots[bundleID] = PatchPathValidator.canonicalFileURL(URL(fileURLWithPath: path, isDirectory: true))
+
+            // 2) Fallback: MCM deja de devolver contenedores de bundle en iOS 27.
+            //    Se resuelve por filesystem, sin depender de la versión.
+            if let fallback = AppBundleLocator.resolve(bundleID: bundleID),
+               let resolvedPath = fallback.dataPath ?? fallback.bundlePath {
+                log("patch: fallback resolver used for \(bundleID)")
+                roots[bundleID] = PatchPathValidator.canonicalFileURL(
+                    URL(fileURLWithPath: resolvedPath, isDirectory: true)
+                )
+                continue
+            }
+
+            throw PatchPackageError.targetAppUnavailable(bundleID)
         }
         return try operation(roots)
     }
